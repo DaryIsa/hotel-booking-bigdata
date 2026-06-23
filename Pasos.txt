@@ -1,0 +1,180 @@
+===================
+          CHEATSHEET DE EJECUCIÓN: PIPELINE END-TO-END (HOTEL PROJECT)
+================================================================================
+
+--------------------------------------------------------------------------------
+ETAPA 1: INGESTA Y PROCESAMIENTO INICIAL (HADOOP & PIG)
+--------------------------------------------------------------------------------
+
+1. Levantamiento del Entorno y Formateo (Reset si el NameNode falla)
+   $ jps
+   $ start-dfs.sh
+   $ hdfs namenode -format   # (Solo ejecutar si el NameNode no levanta)
+   $ start-dfs.sh && start-yarn.sh
+   $ jps                     # Salida: NameNode, DataNode, SecondaryNameNode, 
+                             # ResourceManager, NodeManager, Jps
+
+2. Estructura HDFS e Ingesta Cruda
+   $ hdfs dfs -mkdir -p /hotel_project/raw_data /hotel_project/clean_data
+   $ hdfs dfs -put /home/estefani-nava/hotels.csv /hotel_project/raw_data/
+   $ hdfs dfs -ls /hotel_project/raw_data
+
+3. Creación del Script de Limpieza
+   $ nano hotel_cleaning.pig
+
+   --- CONTENIDO DEL SCRIPT 'hotel_cleaning.pig' ---
+   raw_data = LOAD '/hotel_project/raw_data/hotels.csv' USING PigStorage(',') AS (hotel:chararray, is_canceled:int, lead_time:int, arrival_date_year:int, arrival_date_month:chararray, arrival_date_week_number:int, arrival_date_day_of_month:int, stays_in_weekend_nights:int, stays_in_week_nights:int, adults:int, children:chararray, babies:int, meal:chararray, country:chararray, market_segment:chararray, distribution_channel:chararray, is_repeated_guest:int, previous_cancellations:int, previous_bookings_not_canceled:int, reserved_room_type:chararray, assigned_room_type:chararray, booking_changes:int, deposit_type:chararray, agent:chararray, company:chararray, days_in_waiting_list:int, customer_type:chararray, adr:double, required_car_parking_spaces:int, total_of_special_requests:int, reservation_status:chararray, reservation_status_date:chararray);
+
+   data_no_header = FILTER raw_data BY hotel != 'hotel';
+   valid_data = FILTER data_no_header BY adults > 0 AND lead_time >= 0 AND adr >= 0;
+   STORE valid_data INTO '/hotel_project/clean_data' USING PigStorage(',');
+   -------------------------------------------------
+
+4. Ejecución y Validación
+   $ hdfs dfs -rm -r /hotel_project/clean_data  # Limpieza de seguridad previa
+   $ pig hotel_cleaning.pig
+   $ hdfs dfs -cat /hotel_project/clean_data/part-m-00000 | wc -l  # Esperado: 118986
+
+
+--------------------------------------------------------------------------------
+ETAPA 2: ALMACENAMIENTO Y CONSULTAS OLAP (HIVE)
+--------------------------------------------------------------------------------
+
+1. Inicialización y Base de Datos
+   $ hive
+
+   --- EN CONSOLA HIVE ---
+   hive> CREATE DATABASE IF NOT EXISTS hotel_dw;
+   hive> USE hotel_dw;
+
+2. Mapeo de Tabla Externa a HDFS Clean
+   hive> CREATE EXTERNAL TABLE IF NOT EXISTS reservas (
+             hotel STRING, is_canceled INT, lead_time INT, arrival_date_year INT, arrival_date_month STRING, arrival_date_week_number INT, arrival_date_day_of_month INT, stays_in_weekend_nights INT, stays_in_week_nights INT, adults INT, children STRING, babies INT, meal STRING, country STRING, market_segment STRING, distribution_channel STRING, is_repeated_guest INT, previous_cancellations INT, previous_bookings_not_canceled INT, reserved_room_type STRING, assigned_room_type STRING, booking_changes INT, deposit_type STRING, agent STRING, company STRING, days_in_waiting_list INT, customer_type STRING, adr DOUBLE, required_car_parking_spaces INT, total_of_special_requests INT, reservation_status STRING, reservation_status_date STRING
+         ) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' LOCATION '/hotel_project/clean_data';
+
+   hive> SELECT COUNT(*) FROM reservas; -- Validación: 118986
+
+3. Consultas de Negocio de Muestra
+   hive> SELECT hotel, COUNT(*) FROM reservas GROUP BY hotel;
+   hive> SELECT country, SUM(is_canceled) AS canc FROM reservas GROUP BY country ORDER BY canc DESC LIMIT 10;
+   hive> exit;
+
+
+--------------------------------------------------------------------------------
+ETAPA 3: FEATURE ENGINEERING (SPARK DATAFRAME)
+--------------------------------------------------------------------------------
+
+1. Creación del Script de Spark
+   $ nano feature_engineering.py
+
+   --- CONTENIDO DEL SCRIPT 'feature_engineering.py' ---
+   from pyspark.sql import SparkSession
+   from pyspark.sql.functions import col
+   from pyspark.ml.feature import StringIndexer, VectorAssembler
+
+   spark = SparkSession.builder.appName("HotelML").getOrCreate()
+   df_raw = spark.read.csv("hdfs://localhost:9000/hotel_project/clean_data/part-m-00000", inferSchema=True)
+
+   columns = ["hotel","is_canceled","lead_time","arrival_date_year","arrival_date_month","arrival_date_week_number","arrival_date_day_of_month","stays_weekend_nights","stays_week_nights","adults","children","babies","meal","country","market_segment","distribution_channel","is_repeated_guest","previous_cancellations","previous_bookings_not_canceled","reserved_room_type","assigned_room_type","booking_changes","deposit_type","agent","company","days_in_waiting_list","customer_type","adr","required_car_parking_spaces","total_of_special_requests","reservation_status","reservation_status_date"]
+   df = df_raw.toDF(*columns)
+
+   # Transformaciones lógicas e ingeniería de variables
+   df = df.withColumn("stays_nights", col("stays_weekend_nights") + col("stays_week_nights"))
+   df = df.withColumn("total_guests", col("adults") + col("children").cast("int") + col("babies"))
+   df_model = df.select("is_canceled", "lead_time", "stays_nights", "previous_cancellations", "total_guests", "hotel", "country", "market_segment", "customer_type", "deposit_type", "adr")
+
+   # Indexación Categórica
+   for c in ["hotel", "country", "market_segment", "customer_type", "deposit_type"]:
+       df_model = StringIndexer(inputCol=c, outputCol=c+"_index").fit(df_model).transform(df_model)
+
+   # Ensamblador Vectorial para MLlib
+   feature_cols = ["lead_time", "stays_nights", "previous_cancellations", "total_guests", "hotel_index", "country_index", "segment_index", "customer_index", "deposit_index", "adr"]
+   final_dataset = VectorAssembler(inputCols=feature_cols, outputCol="features").transform(df_model).select("features", "is_canceled")
+
+
+--------------------------------------------------------------------------------
+ETAPA 4: MODELO PREDICTIVO (SPARK MLLIB)
+--------------------------------------------------------------------------------
+
+   # continuación del archivo 'feature_engineering.py' ...
+   
+   # División de datos (Train / Test Split)
+   train_data, test_data = final_dataset.randomSplit([0.8, 0.2], seed=42)
+
+   # Entrenamiento de Regresión Logística
+   from pyspark.ml.classification import LogisticRegression
+   lr = LogisticRegression(featuresCol="features", labelCol="is_canceled", maxIter=10)
+   model = lr.fit(train_data)
+   predictions = model.transform(test_data)
+
+   # Evaluación de Métricas
+   from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
+   acc = MulticlassClassificationEvaluator(labelCol="is_canceled", metricName="accuracy").evaluate(predictions)
+   auc = BinaryClassificationEvaluator(labelCol="is_canceled", metricName="areaUnderROC").evaluate(predictions)
+
+   print(f"Accuracy obtenida: {acc:.2f}")
+   print(f"ROC-AUC obtenido: {auc:.2f}")
+
+   # Exportación del dataframe de predicciones a entorno local de Python
+   predictions.select("is_canceled", "prediction").toPandas().to_csv("predicciones.csv", index=False)
+   ------------------------------------------------------
+
+2. Ejecución del Pipeline en Spark
+   $ spark-submit feature_engineering.py
+
+
+--------------------------------------------------------------------------------
+ETAPA 5: VISUALIZACIÓN DE RESULTADOS (PYTHON LOCAL)
+--------------------------------------------------------------------------------
+
+1. Instalación de librerías en entorno local
+   $ pip install matplotlib seaborn pandas scikit-learn
+
+2. Creación del Script Gráfico
+   $ nano plots.py
+
+   --- CONTENIDO DEL SCRIPT 'plots.py' ---
+   import pandas as pd
+   import matplotlib.pyplot as plt
+   import seaborn as sns
+   from sklearn.metrics import confusion_matrix, roc_curve, auc
+
+   # Carga de los archivos origen y salidas generadas por Spark
+   df_raw = pd.read_csv("hotels.csv")
+   df_preds = pd.read_csv("predicciones.csv")
+
+   # Gráfico 1: Histograma de Cancelaciones Geográficas
+   plt.figure(figsize=(8,4))
+   df_raw.groupby("country")["is_canceled"].sum().sort_values(ascending=False).head(10).plot(kind='bar', color='teal')
+   plt.title("Top 10 Países con Mayor Frecuencia de Cancelaciones")
+   plt.ylabel("Cancelaciones")
+   plt.tight_layout()
+   plt.show()
+
+   # Gráfico 2: Matriz de Confusión
+   plt.figure(figsize=(6,5))
+   cm = confusion_matrix(df_preds["is_canceled"], df_preds["prediction"])
+   sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["No Canc", "Canc"], yticklabels=["No Canc", "Canc"])
+   plt.title("Matriz de Confusión del Modelo Baseline")
+   plt.ylabel("Real")
+   plt.xlabel("Predicción")
+   plt.show()
+
+   # Gráfico 3: Curva ROC (Evaluación de discriminación binaria)
+   plt.figure(figsize=(6,4))
+   fpr, tpr, _ = roc_curve(df_preds["is_canceled"], df_preds["prediction"])
+   plt.plot(fpr, tpr, label=f"AUC = {auc(fpr, tpr):.2f}", color="darkorange", lw=2)
+   plt.plot([0,1],[0,1],"--", color="navy")
+   plt.title("Curva ROC del Sistema Predictivo")
+   plt.xlabel("Falsos Positivos")
+   plt.ylabel("Verdaderos Positivos")
+   plt.legend()
+   plt.show()
+   ---------------------------------------
+
+3. Lanzamiento y Generación de Dashboards
+   $ python plots.py
+
+================================================================================
+                      FIN DEL PIPELINE DE EJECUCIÓN
+=============================================================

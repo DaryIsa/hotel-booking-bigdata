@@ -1,0 +1,272 @@
+ETAPA 1:Ingesta y procesamiento inicial
+1. Revisión previa que todo funcione 
+- hdfs dfs -ls / ºRevisar que este encendido y corriendo el hdfs
+- hadoop version ºRevision version de hadoop instalada
+- jps ºRevisar qué está encendido
+- start-dfs.sh ºInicializar todo, ojo si no funciona se debe reiniciar
+- jps º Revisar que todo este encendido
+- hdfs namenode -format º Reinicio necesario porque no inicio Namenode
+- jps ºRevisión inicio con jps, debe salir
+- start-dfs.sh º Ahora si el inicio bien
+- start-yarn.sh ºInicio de yarn también
+- hdfs dfs -ls / ºChecar inicio hdfs
+- jps ºRevisión de encendido todo bien si: 10595 NodeManager
+9156 SecondaryNameNode
+10455 ResourceManager
+8936 DataNode
+9784 NameNode
+11082 Jps
+
+2. Crear estructura del proyecto en HDFS
+ESTRUCTURA PROPUESTA:
+/hotel_project
+    /raw_data
+    /clean_data
+    
+- Creación de directorios
+- hdfs dfs -mkdir /hotel_project
+- hdfs dfs -mkdir /hotel_project/raw_data
+- hdfs dfs -mkdir /hotel_project/clean_data
+- Verificación de creación correcta
+- hdfs dfs -ls /hotel_project º (raw_data
+clean_data)
+
+3. Subir el CSV a HDFS
+- Para ello se debe conocer la ubicación del csv descargado para asi poder colorcarlo en el hdfs
+- UBICACIÓN: /home/estefani-nava/hotels.csv
+- hdfs dfs -put /home/estefani-nava/hotels.csv /hotel_project/raw_data/ ºAsí se sube a la carpeta de raw data (previo a limpieza)
+- hdfs dfs -ls /hotel_project/raw_data ºVerificación de creación (hotels.csv)
+
+
+Found 2 items
+drwxr-xr-x   - estefani-nava supergroup          0 2026-06-15 14:14 /hotel_project/clean_data
+drwxr-xr-x   - estefani-nava supergroup          0 2026-06-15 14:14 /hotel_project/raw_data
+
+
+- hdfs dfs -cat /hotel_project/raw_data/hotels.csv | head ºMostrar las primeras filas para verificar que hadoop pueda leerlo
+
+4. Creación del script .PIG 
+Esto para que el script "hotel_cleaning.pig" se cree para limpiar los datos con cosas como eliminar encebezado, filtrar registros invalidos, seleccionar columnas finales, eliminar registros nulos
+
+-nano hotel_cleaning.pig ºCreación del script PIG
+-ºCONTENIDO::
+-- Cargar CSV
+
+raw_data = LOAD '/hotel_project/raw_data/hotels.csv'
+USING PigStorage(',')
+AS (
+    hotel:chararray,
+    is_canceled:int,
+    lead_time:int,
+    arrival_date_year:int,
+    arrival_date_month:chararray,
+    arrival_date_week_number:int,
+    arrival_date_day_of_month:int,
+    stays_in_weekend_nights:int,
+    stays_in_week_nights:int,
+    adults:int,
+    children:int,
+    babies:int,
+    meal:chararray,
+    country:chararray,
+    market_segment:chararray,
+    distribution_channel:chararray,
+    is_repeated_guest:int,
+    previous_cancellations:int,
+    previous_bookings_not_canceled:int,
+    reserved_room_type:chararray,
+    assigned_room_type:chararray,
+    booking_changes:int,
+    deposit_type:chararray,
+    agent:chararray,
+    company:chararray,
+    days_in_waiting_list:int,
+    customer_type:chararray,
+    adr:double,
+    required_car_parking_spaces:int,
+    total_of_special_requests:int,
+    reservation_status:chararray,
+    reservation_status_date:chararray
+);
+
+-- Eliminar encabezado
+
+data_no_header =
+FILTER raw_data BY hotel != 'hotel';
+
+-- Eliminar registros nulos importantes
+
+data_clean =
+FILTER data_no_header BY
+hotel IS NOT NULL AND
+country IS NOT NULL AND
+children IS NOT NULL;
+
+-- Filtrar registros inválidos
+
+valid_data =
+FILTER data_clean BY
+adults > 0 AND
+lead_time >= 0 AND
+adr >= 0;
+
+-- Seleccionar columnas finales
+
+final_data =
+FOREACH valid_data GENERATE
+hotel,
+is_canceled,
+lead_time,
+arrival_date_year,
+arrival_date_month,
+adults,
+children,
+babies,
+country,
+market_segment,
+customer_type,
+adr,
+reservation_status;
+
+STORE final_data
+INTO '/hotel_project/clean_data'
+USING PigStorage(',');
+
+
+-Guardar y salir : CTRL + O ENTER CTRL + X
+
+5. Ejecutar PIG
+- pig hotel_cleaning.pig ºEjecución script
+
+6. Verificación de salida
+- hdfs dfs -ls /hotel_project/clean_data ºVer archivos generados
+- hdfs dfs -cat /hotel_project/clean_data/part-r-00000 | head ºVer algunas filas
+- CORRECCIÓN. 
+Solución rápida
+Eliminar el directorio de salida:
+hdfs dfs -rm -r /hotel_project/clean_data
+Verifica:
+hdfs dfs -ls /hotel_project
+Ahora debería quedar solamente:
+/hotel_project/raw_data
+Volver a ejecutar Pig
+pig hotel_cleaning.pig
+Success! o 100% complete
+
+- Verificación de resultados
+Verificar resultados
+hdfs dfs -ls /hotel_project/clean_data
+Ahora deberías obtener algo parecido a:
+part-r-00000
+_SUCCESS
+Luego:
+hdfs dfs -cat /hotel_project/clean_data/part-r-00000 | head
+
+-CORRECCIÓN 2: falla en limpieza porque eliminaba todo
+- 1) Corrección con nano hotel_cleaning.pig
+
+raw_data = LOAD '/hotel_project/raw_data/hotels.csv'
+USING PigStorage(',')
+AS (
+    hotel:chararray,
+    is_canceled:int,
+    lead_time:int,
+    arrival_date_year:int,
+    arrival_date_month:chararray,
+    arrival_date_week_number:int,
+    arrival_date_day_of_month:int,
+    stays_in_weekend_nights:int,
+    stays_in_week_nights:int,
+    adults:int,
+    children:chararray,
+    babies:int,
+    meal:chararray,
+    country:chararray,
+    market_segment:chararray,
+    distribution_channel:chararray,
+    is_repeated_guest:int,
+    previous_cancellations:int,
+    previous_bookings_not_canceled:int,
+    reserved_room_type:chararray,
+    assigned_room_type:chararray,
+    booking_changes:int,
+    deposit_type:chararray,
+    agent:chararray,
+    company:chararray,
+    days_in_waiting_list:int,
+    customer_type:chararray,
+    adr:double,
+    required_car_parking_spaces:int,
+    total_of_special_requests:int,
+    reservation_status:chararray,
+    reservation_status_date:chararray
+);
+
+data_no_header =
+FILTER raw_data BY hotel != 'hotel';
+
+valid_data =
+FILTER data_no_header BY
+adults > 0 AND
+lead_time >= 0 AND
+adr >= 0;
+
+STORE valid_data
+INTO '/hotel_project/clean_data'
+USING PigStorage(',');
+
+- 2) Eliminación de la anterior carpeta de datos limpios
+hdfs dfs -rm -r /hotel_project/clean_data ºEliminación 
+hdfs dfs -ls /hotel_project ºConfirmación de eliminación
+
+- 3) Ejecución del script hotel_cleaning.pig
+pig hotel_cleaning.pig
+
+- 4) Verificación
+hdfs dfs -ls /hotel_project/clean_data
+SALIDA: Found 2 items
+-rw-r--r--   1 estefani-nava supergroup          0 2026-06-15 15:52 /hotel_project/clean_data/_SUCCESS
+-rw-r--r--   1 estefani-nava supergroup   16937643 2026-06-15 15:52 /hotel_project/clean_data/part-m-00000
+
+hdfs dfs -cat /hotel_project/clean_data/part-m-00000 | head ºMostrar primeras 5 filas
+
+hdfs dfs -cat /hotel_project/clean_data/part-m-00000 | wc -l ºRevisión cantidad de registros
+SALIDA: 118986
+
+
+- COnclusion
+1) ingesta
+hdfs dfs -ls /hotel_project/raw_data
+2 Ejecución
+pig hotel_cleaning.pig
+3) Datos limpios
+
+Arquitectura lograda
+hotels.csv
+     ↓
+HDFS (/raw_data)
+     ↓
+Pig
+     ↓
+Eliminación de nulos
+     ↓
+Validación de registros
+     ↓
+Selección de atributos
+     ↓
+HDFS (/clean_data)
+hdfs dfs -cat /hotel_project/clean_data/part-r-00000 | head
+
+
+ANTES DE LA PT2
+estefani-nava@estefani-nava-HVY-WXX9:~$ hdfs dfs -ls /
+WARNING: HADOOP_PREFIX has been replaced by HADOOP_HOME. Using value of HADOOP_PREFIX.
+Found 2 items
+drwxr-xr-x   - estefani-nava supergroup          0 2026-06-15 15:52 /hotel_project
+drwxr-xr-x   - estefani-nava supergroup          0 2026-06-15 15:55 /tmp
+
+pig -version
+Apache Pig version 0.17.0 (r1797386) 
+compiled Jun 02 2017, 15:41:58
+
+
